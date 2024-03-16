@@ -10,6 +10,8 @@
 #include <linux/kernel.h>
 #include <linux/fs.h>
 #include <linux/cdev.h>
+#include <linux/timekeeping.h>
+#include <linux/spinlock.h>
 #include <linux/device.h>
 #include <asm/uaccess.h>
 
@@ -22,29 +24,89 @@ static struct cdev devone_cdev;
 static struct class *devone_class = NULL;
 static dev_t devone_dev;
 
+#define OPENCODER_CPR 112
 #define GPIO_1 229 //gpio 1
+#define BUFFER_SIZE 10
 static const char DeviceName[] = "devonedev";
 static int gpio_1_irg;
+struct tasklet_struct mytask = {0};
+spinlock_t gpio_lock, read_lock;
 
-static irqreturn_t gpio_irq(int irq, void *dev_id) {
-    
+struct RawRotatryInfo{
+    int count;
+    struct timespec64 tv;
+};
+struct RotatryInfo{
+    int count;
+    int64_t time;
+};
+struct RawRotatryInfo rotatry_info, irq_data;
+struct RotatryInfo read_data[10];
 
-    int volt = gpio_get_value(GPIO_1);
+static int data_index;
+
+void tasklet_handler(unsigned long data)
+{
+    unsigned long flags, flags_read;
+    struct RawRotatryInfo tmp;
+    {
+        spin_lock_irqsave(&gpio_lock, flags);
+        tmp = rotatry_info;
+        spin_unlock_irqrestore(&gpio_lock, flags);
+    }
+    {
+        spin_lock_irqsave(&read_lock, flags_read);
+        read_data[data_index].count = rotatry_info.count;
+        read_data[data_index].time = timespec64_to_ns(&rotatry_info.tv);
+
+        spin_unlock_irqrestore(&read_lock, flags_read);
+    }
+    ++data_index;
+    if(data_index >= BUFFER_SIZE)
+        data_index = 0;
+
+}
+static irqreturn_t gpio_handler(int irq, void *dev_id) 
+{
+    // TODO: I need to add buffer pool & spin_lock_irq to handle this situation.
+    // Because irq_top & irp_bottom is different frequency, the data was modified by irq_top 
+    // before irq_bottom load data maybe.
+    unsigned long flags;
+
+    ktime_get_boottime_ts64(&irq_data.tv);
+    ++irq_data.count;
+    if(irq_data.count >= OPENCODER_CPR) irq_data.count = 0; 
+
+    spin_lock_irqsave(&gpio_lock, flags);
+    rotatry_info = irq_data;
+    spin_unlock_irqrestore(&gpio_lock, flags);
+    tasklet_schedule(&mytask);
     return IRQ_HANDLED;
+}
+
+int devone_open(struct inode *inode, struct file *file_ptr)
+{
+  printk(KERN_NOTICE "encoder_open, version\n");
+  return 0;
 }
 
 ssize_t devone_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos)
 {
-    int i;
-    unsigned char val = 0xc0;
     int retval;
-    //dump_stack();
+    unsigned long flags;
+    struct RotatryInfo tmp[BUFFER_SIZE];
+    spin_lock_irqsave(&read_lock, flags);
+    memcpy(tmp, read_data, sizeof(struct RotatryInfo) * BUFFER_SIZE);
+    spin_unlock_irqrestore(&read_lock, flags);
 
-    for (i = 0 ; i < count ; i++) {
-        if (copy_to_user(&buf[i], &val, 1)) {
-            retval = -EFAULT;
-            goto out;
-        }
+    if(count > BUFFER_SIZE)
+    {
+        retval = -EFAULT;
+        goto out;
+    }
+    if (copy_to_user(buf, tmp, count * sizeof(struct RotatryInfo))) {
+        retval = -EFAULT;
+        goto out;
     }
     retval = count;
 out:
@@ -53,7 +115,8 @@ out:
 }
 
 struct file_operations devone_fops = {
-    .read = devone_read,
+    .open = devone_open,
+    .read = devone_read
 };
 
 static int
@@ -82,7 +145,7 @@ pinInit(int pin, irqreturn_t (*gpio_irq)(int, void *))
     }
     rv = request_irq(irqNum,
             (void *) gpio_irq,
-            IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING,
+            IRQF_TRIGGER_RISING,
             DeviceName,
             NULL);
     if (rv != 0) {
@@ -137,8 +200,15 @@ static int devone_init(void)
 
     printk(KERN_ALERT "devone driver(major %d) installed.\n", major);
 
-    gpio_1_irg = pinInit(GPIO_1, gpio_irq);
+    data_index = 0;
+    irq_data =(struct RawRotatryInfo){0 ,(struct timespec64){0 , 0}};
+    rotatry_info =(struct RawRotatryInfo){0 ,(struct timespec64){0 , 0}};
+    spin_lock_init(&gpio_lock);
+    spin_lock_init(&read_lock);
+    tasklet_init(&mytask, tasklet_handler, 0); //define static time member and update it value when irq trigger
+    gpio_1_irg = pinInit(GPIO_1, gpio_handler);
     if(gpio_1_irg == -1) goto error;
+
 
     return 0;
 
@@ -170,7 +240,7 @@ static void devone_exit(void)
 
     free_irq(gpio_1_irg, NULL);
     gpio_free(GPIO_1);
-
+    tasklet_kill(&mytask);
     printk(KERN_ALERT "devone driver removed.\n");
 
 }
